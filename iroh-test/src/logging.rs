@@ -2,9 +2,11 @@
 
 use tokio::runtime::RuntimeFlavor;
 use tracing::level_filters::LevelFilter;
-use tracing_subscriber::layer::{Layer, SubscriberExt};
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
+use tracing_subscriber::{
+    layer::{Layer, SubscriberExt},
+    util::SubscriberInitExt,
+    EnvFilter,
+};
 
 /// Configures logging for the current test, **single-threaded runtime only**.
 ///
@@ -25,6 +27,7 @@ use tracing_subscriber::EnvFilter;
 ///     let _guard = iroh_test::logging::setup();
 ///     assert!(true);
 /// }
+/// ```
 #[must_use = "The tracing guard must only be dropped at the end of the test"]
 pub fn setup() -> tracing::subscriber::DefaultGuard {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -37,6 +40,25 @@ pub fn setup() -> tracing::subscriber::DefaultGuard {
         }
     }
     testing_subscriber().set_default()
+}
+
+/// The first call to this function will install a global logger.
+///
+/// The logger uses the `RUST_LOG` environment variable to decide on what level to log
+/// anything, which is set by our CI.  When running the tests with nextest the log
+/// output will be captured for just the executing test.
+///
+/// Logs to stdout since the assertion messages are logged on stderr by default.
+pub fn setup_multithreaded() {
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::fmt::layer()
+                .event_format(tracing_subscriber::fmt::format().with_line_number(true))
+                .with_writer(std::io::stdout),
+        )
+        .with(EnvFilter::from_default_env())
+        .try_init()
+        .ok();
 }
 
 // /// Invoke the future with test logging configured.
@@ -74,12 +96,14 @@ pub fn testing_subscriber() -> impl tracing::Subscriber {
         Some(_) => None,
         None => Some(
             tracing_subscriber::fmt::layer()
+                .event_format(tracing_subscriber::fmt::format().with_line_number(true))
                 .with_writer(|| TestWriter)
                 .with_filter(LevelFilter::TRACE),
         ),
     };
     let env_log_layer = var.map(|_| {
         tracing_subscriber::fmt::layer()
+            .event_format(tracing_subscriber::fmt::format().with_line_number(true))
             .with_writer(|| TestWriter)
             .with_filter(EnvFilter::from_default_env())
     });
