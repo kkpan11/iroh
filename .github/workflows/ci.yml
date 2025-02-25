@@ -2,230 +2,271 @@ name: CI
 
 on:
   pull_request:
+    types: ["labeled", "unlabeled", "opened", "synchronize", "reopened"]
   merge_group:
   push:
     branches:
       - main
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
   RUST_BACKTRACE: 1
   RUSTFLAGS: -Dwarnings
   RUSTDOCFLAGS: -Dwarnings
-  MSRV: "1.72"
-  CRATES_LIST: "iroh,iroh-bytes,iroh-gossip,iroh-metrics,iroh-net,iroh-sync,iroh-test"
-  SCCACHE_CACHE_SIZE: "50G"
+  MSRV: "1.81"
+  SCCACHE_CACHE_SIZE: "10G"
+  IROH_FORCE_STAGING_RELAYS: "1"
 
 jobs:
-  build_and_test_nix:
+  tests:
+    name: CI Test Suite
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    uses: "./.github/workflows/tests.yaml"
+
+  cross_build:
+    name: Cross Build Only
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
-    name: "Tests"
-    runs-on: ${{ matrix.runner }}
+    runs-on: [self-hosted, linux, X64]
     strategy:
       fail-fast: false
       matrix:
-        name: [ubuntu-latest, macOS-arm-latest]
-        rust: [nightly, stable]
-        features: [all, none, default]
-        include:
-          - name: ubuntu-latest
-            os: ubuntu-latest
-            release-os: linux
-            release-arch: amd64
-            runner: [self-hosted, linux, X64]
-          - name: macOS-arm-latest
-            os: macOS-latest
-            release-os: darwin
-            release-arch: aarch64
-            runner: [self-hosted, macOS, ARM64]
-    env:
-      # Using self-hosted runners so use local cache for sccache and
-      # not SCCACHE_GHA_ENABLED.
-      RUSTC_WRAPPER: "sccache"
-    steps:
-    - name: Checkout
-      uses: actions/checkout@master
-      with:
-        submodules: recursive
-
-    - name: Install ${{ matrix.rust }}
-      uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ matrix.rust }}
-    
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
-
-    - name: Select features
-      run: |
-        case "${{ matrix.features }}" in
-            all)
-                echo "FEATURES=--all-features" >> "$GITHUB_ENV"
-                ;;
-            none)
-                echo "FEATURES=--no-default-features" >> "$GITHUB_ENV"
-                ;;
-            default)
-                echo "FEATURES=" >> "$GITHUB_ENV"
-                ;;
-            *)
-                exit 1
-        esac
-
-    - name: check features
-      run: |
-        for i in ${CRATES_LIST//,/ }
-        do
-          echo "Checking $i $FEATURES"
-          cargo check -p $i $FEATURES --lib --bins
-        done
-      env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
-
-    - name: tests
-      run: cargo test --workspace ${{ env.FEATURES }} --lib --bins --tests
-      env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
-
-    - name: doctests
-      if: ${{ matrix.features == 'all' }}
-      run: cargo test --workspace --all-features --doc
-      env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
-
-  build_and_test_windows:
-    timeout-minutes: 30
-    name: "Tests"
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        name: [windows-latest]
-        rust: [nightly, stable]
-        features: [all, none, default]
         target:
-          - x86_64-pc-windows-msvc
-        include:
-          - name: windows-latest
-            os: windows
-            runner: [self-hosted, windows, x64]
-    env:
-      # Using self-hosted runners so use local cache for sccache and
-      # not SCCACHE_GHA_ENABLED.
-      RUSTC_WRAPPER: "sccache"
+          # cross tests are currently broken vor armv7 and aarch64
+          # see https://github.com/cross-rs/cross/issues/1311
+          # - armv7-linux-androideabi
+          # - aarch64-linux-android
+          # Freebsd execution fails in cross
+          # - i686-unknown-freebsd # Linking fails :/
+          - x86_64-unknown-freebsd
+          # Netbsd execution fails to link in cross
+          # - x86_64-unknown-netbsd
     steps:
-    - name: Checkout
-      uses: actions/checkout@master
-      with:
-        submodules: recursive
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Install ${{ matrix.rust }}
-      run: |
-        rustup toolchain install ${{ matrix.rust }}
-        rustup toolchain default ${{ matrix.rust }}
-        rustup target add ${{ matrix.target }}
-        rustup set default-host ${{ matrix.target }}
+      - name: Install rust stable
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Select features
-      run: |
-        switch ("${{ matrix.features }}") {
-            "all" {
-                echo "FEATURES=--all-features" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
-            }
-            "none" {
-                echo "FEATURES=--no-default-features" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
-            }
-            "default" {
-                echo "FEATURES=" | Out-File -FilePath $Env:GITHUB_ENV -Encoding utf8 -Append
-            }
-            default {
-                Exit 1
-            }
-        }
+      - name: Cleanup Docker
+        continue-on-error: true
+        run: |
+          docker kill $(docker ps -q)
 
-    # TODO: disabled while we do not have Powershell 7+ on the runner
-    # as default shell. See https://github.com/actions/toolkit/issues/1179
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
+        # See https://github.com/cross-rs/cross/issues/1222
+      - uses: taiki-e/install-action@cross
 
-    - uses: msys2/setup-msys2@v2
+      - name: build
+        # cross tests are currently broken vor armv7 and aarch64
+        # see https://github.com/cross-rs/cross/issues/1311.  So on
+        # those platforms we only build but do not run tests.
+        run: cross build --all --target ${{ matrix.target }}
+        env:
+          RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG'}}
 
-    - name: tests
-      run: cargo test --workspace ${{ env.FEATURES }} --lib --bins --tests --target ${{ matrix.target }}
-      env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
-
-  cross:
+  android_build:
+    name: Android Build Only
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
-    name: Cross compile
+    # runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          target: ${{ matrix.target }}
+      - name: Install rustup target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "temurin"
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Setup Android NDK
+        uses: arqu/setup-ndk@main
+        id: setup-ndk
+        with:
+          ndk-version: r23
+          add-to-path: true
+
+      - name: Build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo install --version 3.5.4 cargo-ndk
+          cargo ndk --target ${{ matrix.target }} build
+
+  cross_test:
+    name: Cross Test
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
     runs-on: [self-hosted, linux, X64]
     strategy:
       fail-fast: false
       matrix:
         target:
           - i686-unknown-linux-gnu
-          - armv7-linux-androideabi
-          - aarch64-linux-android
     steps:
-    - name: Checkout
-      uses: actions/checkout@master
-      with:
-        submodules: recursive
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
 
-    - name: Install rust stable
-      uses: dtolnay/rust-toolchain@stable
+      - name: Install rust stable
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Cleanup Docker
-      continue-on-error: true
-      run: |
-        docker kill $(docker ps -q)
+      - name: Cleanup Docker
+        continue-on-error: true
+        run: |
+          docker kill $(docker ps -q)
 
-    - name: Install cross
-      # See https://github.com/cross-rs/cross/issues/1222
-      run: cargo install cross --git https://github.com/cross-rs/cross
+        # See https://github.com/cross-rs/cross/issues/1222
+      - uses: taiki-e/install-action@cross
 
-    - name: build
-      # cross tests are currently broken vor armv7 and aarch64
-      # see https://github.com/cross-rs/cross/issues/1311.  So on
-      # those platforms we only build but do not run tests.
-      if: matrix.target != 'i686-unknown-linux-gnu'
-      run: cross build --all --target ${{ matrix.target }}
-      env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
+      - name: test
+        run: cross test --all --target ${{ matrix.target }} -- --test-threads=12
+        env:
+          RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG' }}
 
-    - name: test
-      # cross tests are currently broken vor armv7 and aarch64
-      # see https://github.com/cross-rs/cross/issues/1311
-      if: matrix.target == 'i686-unknown-linux-gnu'
-      run: cross test --all --target ${{ matrix.target }} -- --test-threads=12
-      env:
-        RUST_LOG: ${{ runner.debug && 'DEBUG' || 'INFO'}}
+  wasm_test:
+    name: Build & test wasm32 for browsers
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v4
 
-  check_fmt_and_docs:
-    timeout-minutes: 30
-    name: Checking fmt and docs
+      - name: Setup node.js version 22.5 # needed for browser-like websocket API support in node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22.5
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Add wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+      
+      - name: Install wasm-bindgen-test-runner
+        run: cargo binstall wasm-bindgen-cli --locked --no-confirm
+
+      - name: Install wasm-tools
+        uses: bytecodealliance/actions/wasm-tools/setup@v1
+
+      - name: wasm32 build (iroh-base)
+        run: cargo build --target wasm32-unknown-unknown -p iroh-base --all-features
+
+      - name: wasm32 build (iroh-relay)
+        run: cargo build --target wasm32-unknown-unknown -p iroh-relay --no-default-features
+
+      - name: wasm32 build (iroh-net-report)
+        run: cargo build --target wasm32-unknown-unknown -p iroh-net-report --no-default-features
+
+      - name: wasm32 build (iroh)
+        run: cargo build --target wasm32-unknown-unknown -p iroh --no-default-features
+
+      # If the Wasm file contains any 'import "env"' declarations, then
+      # some non-Wasm-compatible code made it into the final code.
+      - name: Ensure no 'import "env"' in iroh-relay Wasm
+        run: |
+          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/iroh_relay.wasm | grep 'import "env"'
+
+      - name: Ensure no 'import "env"' in iroh-net-report Wasm
+        run: |
+          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/iroh_net_report.wasm | grep 'import "env"'
+
+      - name: Ensure no 'import "env"' in iroh Wasm
+        run: |
+          ! wasm-tools print --skeleton target/wasm32-unknown-unknown/debug/iroh.wasm | grep 'import "env"'
+
+      - name: Run integration test in wasm
+        run: cargo test -p iroh --test integration --target=wasm32-unknown-unknown --no-default-features
+
+  check_semver:
     runs-on: ubuntu-latest
     env:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
     steps:
-    - uses: actions/checkout@master
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
 
-    - uses: dtolnay/rust-toolchain@stable
-      with:
-        components: rustfmt
+      - name: Setup Environment (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/${{ github.base_ref }})" >> ${GITHUB_ENV}
+      - name: Setup Environment (Push)
+        if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}
+        shell: bash
+        run: |
+          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/main)" >> ${GITHUB_ENV}
+      - name: Check semver
+        # uses: obi1kenobi/cargo-semver-checks-action@v2
+        uses: n0-computer/cargo-semver-checks-action@feat-baseline
+        with:
+          package: iroh, iroh-base, iroh-dns-server, iroh-bench, iroh-relay, iroh-net-report
+          baseline-rev: ${{ env.HEAD_COMMIT_SHA }}
+          use-cache: false
 
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
+  check_fmt:
+    timeout-minutes: 30
+    name: Checking fmt
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - uses: mozilla-actions/sccache-action@v0.0.7
+      - uses: taiki-e/install-action@cargo-make
+      - run: cargo make format-check
 
-    - name: fmt
-      run: cargo fmt --all -- --check
+  check_docs:
+    timeout-minutes: 30
+    name: Checking docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+      RUSTDOCFLAGS: --cfg docsrs
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2024-11-30
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
 
-    - name: Docs
-      run: cargo doc --workspace --all-features --no-deps --document-private-items
+      - name: Docs
+        run: cargo doc --workspace --all-features --no-deps --document-private-items
 
   clippy_check:
     timeout-minutes: 30
@@ -234,28 +275,26 @@ jobs:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
     steps:
-    - uses: actions/checkout@master
-    # Can be switched back to stable once 1.75 lands
-    # https://github.com/rust-lang/cargo/issues/12115#issuecomment-1768170381
-    - uses: dtolnay/rust-toolchain@master
-      with:
-          toolchain: nightly-2023-12-06
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
           components: clippy
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
 
-    # TODO: We have a bunch of platform-dependent code so should
-    #    probably run this job on the full platofrm matrix
-    - name: clippy check (all features)
-      run: cargo clippy --workspace --all-features --all-targets --bins --tests --benches
+      # TODO: We have a bunch of platform-dependent code so should
+      #    probably run this job on the full platform matrix
+      - name: clippy check (all features)
+        run: cargo clippy --workspace --all-features --all-targets --lib --bins --tests --benches --examples
 
-    - name: clippy check (no features)
-      run: cargo clippy --workspace --no-default-features --lib --bins --tests
+      - name: clippy check (no features)
+        run: cargo clippy --workspace --no-default-features --all-targets --lib --bins --tests --benches --examples
 
-    - name: clippy check (default features)
-      run: cargo clippy --workspace --all-targets
+      - name: clippy check (default features)
+        run: cargo clippy --workspace --all-targets --lib --bins --tests --benches --examples
 
   msrv:
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
     name: Minimal Supported Rust Version
     runs-on: ubuntu-latest
@@ -263,134 +302,45 @@ jobs:
       RUSTC_WRAPPER: "sccache"
       SCCACHE_GHA_ENABLED: "on"
     steps:
-    - uses: actions/checkout@master
-    - uses: dtolnay/rust-toolchain@master
-      with:
-        toolchain: ${{ env.MSRV }}
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.7
 
-    - name: Check MSRV all features
-      run: |
-        cargo +$MSRV check --workspace --all-targets --features cli
+      - name: Check MSRV all features
+        run: |
+          cargo +$MSRV check --workspace --all-targets
 
   cargo_deny:
     timeout-minutes: 30
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: EmbarkStudios/cargo-deny-action@v1
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           arguments: --workspace --all-features
           command: check
           command-arguments: "-Dwarnings"
 
   netsim-integration-tests:
+    permissions: write-all
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    uses: "./.github/workflows/netsim_runner.yaml"
+    secrets: inherit
+    with:
+      branch: ${{ github.ref }}
+      max_workers: 4
+      netsim_branch: "main"
+      sim_paths: "sims/iroh/iroh.json,sims/integration"
+      pr_number: ${{ github.event.pull_request.number || '' }}
+
+  codespell:
     timeout-minutes: 30
-    name: Run network simulations/benchmarks
-    runs-on: [self-hosted, linux, X64]
-    env:
-      # Using self-hosted runners so use local cache for sccache and
-      # not SCCACHE_GHA_ENABLED.
-      RUSTC_WRAPPER: "sccache"
+    runs-on: ubuntu-latest
     steps:
-    - name: Checkout
-      uses: actions/checkout@master
-      with:
-        submodules: recursive
-    
-    - name: Install rust stable
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.3
-
-    - name: Build iroh
-      run: |
-        cargo build --release --workspace --all-features
-
-    - name: Fetch and build chuck
-      run: |
-        cd ..
-        rm -rf chuck
-        git clone https://github.com/n0-computer/chuck.git
-        cd chuck
-        cargo build --release
-    
-    - name: Install netsim deps
-      run: |
-        cd ../chuck/netsim
-        sudo apt update
-        ./setup.sh
-
-    - name: Copy binaries to right location
-      run: |
-        cp target/release/iroh ../chuck/netsim/bins/iroh
-        cp target/release/derper ../chuck/netsim/bins/derper
-        cp ../chuck/target/release/chuck ../chuck/netsim/bins/chuck
-
-    - name: Run tests
-      run: |
-        cd ../chuck/netsim
-        sudo kill -9 $(pgrep ovs) || true
-        sudo mn --clean || true
-        sudo python3 main.py ${{ runner.debug && '--debug' || ''}} --integration sims/iroh/iroh.json
-        sudo python3 main.py ${{ runner.debug && '--debug' || ''}} --integration sims/integration
-    - name: Cleanup
-      run: |
-        sudo kill -9 $(pgrep derper) || true
-        sudo kill -9 $(pgrep iroh) || true
-        sudo kill -9 $(pgrep ovs) || true
-        sudo mn --clean || true
-        
-    - name: Setup Environment (PR)  
-      if: ${{ github.event_name == 'pull_request' }}  
-      shell: bash  
-      run: |  
-        echo "LAST_COMMIT_SHA=$(git rev-parse --short ${{ github.event.pull_request.head.sha }})" >> ${GITHUB_ENV}
-        echo "HEAD_REF=${{ github.event.pull_request.head.ref }}" >> ${GITHUB_ENV}
-    - name: Setup Environment (Push)  
-      if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}  
-      shell: bash  
-      run: |  
-        echo "LAST_COMMIT_SHA=$(git rev-parse --short ${GITHUB_SHA})" >> ${GITHUB_ENV}
-        echo "HEAD_REF=${{ github.head_ref }}" >> ${GITHUB_ENV}
-
-    - name: Generate reports
-      run: |
-        cd ../chuck/netsim
-        python3 reports_csv.py --prom --commit ${{ env.LAST_COMMIT_SHA }} > report_prom.txt
-        python3 reports_csv.py --metro --commit ${{ env.LAST_COMMIT_SHA }} > report_metro.txt
-        python3 reports_csv.py --metro --integration --commit ${{ env.LAST_COMMIT_SHA }} > report_metro_integration.txt
-
-    - name: Dump report
-      if: ${{ (github.event.pull_request && !github.event.pull_request.head.repo.fork) || !github.event.pull_request }}
-      run: |
-        export AWS_ACCESS_KEY_ID=${{secrets.S3_ACCESS_KEY_ID}}
-        export AWS_SECRET_ACCESS_KEY=${{secrets.S3_ACCESS_KEY}}
-        export AWS_DEFAULT_REGION=us-west-2
-        
-        curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-        unzip -q awscliv2.zip
-        sudo ./aws/install --update
-
-        cd ../chuck/netsim
-
-        aws_fname=intg_${{ env.LAST_COMMIT_SHA }}.tar.gz
-        tar cvzf report.tar.gz report_prom.txt report_metro.txt report_metro_integration.txt logs/ report/ viz/
-        aws s3 cp ./report.tar.gz s3://${{secrets.S3_REPORT_BUCKET}}/$aws_fname --no-progress
-
-        link_data='dump{fname="'$aws_fname'",commit="'${{ env.LAST_COMMIT_SHA }}'",branch="'${{ env.HEAD_REF }}'"} 1.0'
-        link_data=$(printf "%s\n " "$link_data")
-        curl -X POST -H  "Content-Type: text/plain" --data "$link_data" ${{secrets.PROM_ENDPOINT}}/metrics/job/netsim/instance/${instance}
-
-    - name: Echo metrics
-      run: |
-        cd ../chuck/netsim
-        d=$(cat report_metro.txt)
-        metro_data=$(printf "%s\n " "$d")
-        echo "$metro_data" 
-        d=$(cat report_metro_integration.txt)
-        metro_data=$(printf "%s\n " "$d")
-        echo "$metro_data" 
+      - uses: actions/checkout@v4
+      - run: pip install --user codespell[toml]
+      - run: codespell --ignore-words-list=ans,atmost,crate,inout,ratatui,ser,stayin,swarmin,worl --skip=CHANGELOG.md
